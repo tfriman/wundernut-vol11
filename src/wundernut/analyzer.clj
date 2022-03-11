@@ -5,27 +5,31 @@
 ;; Decoded wav files containing Morse code
 ;; expected file format: RIFF (little-endian) data, WAVE audio, Microsoft PCM, 16 bit, mono 44100 Hz
 
+(def amplitudethreshold
+  "Amplitudes higher than these are counter signals being 'on'"
+  0.11)
+
+(def hz 44100)
+
 (declare morse-codes)
 
-(defn- find-highs
-  "Find indices of those going over the treshold and then getting down again"
-  [snd treshold]
-  (reduce (fn [a [idx v]]
-            (let [elems (:elems a)
-                  up? (:up a)]
-              ;; TODO condp? joku muu struktuuri kuin ifelse
-              (if up?
-                (if (> treshold v)
-                  {:up false
-                   :elems (conj elems idx)}
-                  a)
-                (if (> v treshold)
-                  {:up true
-                   :elems (conj elems idx)}
-                  a))))
-          {:up false
-           :elems []}
-          (keep-indexed (fn [idx itm] [idx itm]) snd)))
+(defn- ->highs
+  "Find indices of those amplitudes going over the threshold and then getting down again"
+  [threshold amplitudes]
+  (:elems
+   (reduce (fn [a [idx v]]
+             (let [elems (:elems a)
+                   up?   (:up a)]
+               (if (and up? (> threshold v))
+                 {:up    false
+                  :elems (conj elems idx)}
+                 (if (and (not up?) (> v threshold))
+                   {:up    true
+                    :elems (conj elems idx)}
+                   a))))
+           {:up    false
+            :elems []}
+           (keep-indexed (fn [idx itm] [idx itm]) amplitudes))))
 
 (defn- ->consecutive-transducer
   "Creates transducer for keeping track of consecutive elements in sequence.
@@ -44,9 +48,13 @@
              (nextfn xf result input previous)
              (firstfn xf result input))))))))
 
-(def remove-consecutive (->consecutive-transducer
-                         (fn [xf result input] (xf result input))
-                         (fn [xf result input previous] (if (= (inc previous) input) result (xf result input)))))
+(def remove-consecutive
+  "Transducer for removing consecutive numbers.
+  [1 2 3 5 6] becomes [1 5]"
+  (->consecutive-transducer
+   (fn [xf result input] (xf result input))
+   (fn [xf result input previous] (if (= (inc previous) input) result (xf result input)))))
+
 (def pair-average
   "Transducer for averaging (flooring) number pairs in sequence.
   [1 10 100] will result [5 55]"
@@ -58,23 +66,32 @@
   "Combined transducer for averaging non-consecutive numbers"
   (comp remove-consecutive pair-average))
 
+(defn- ->thresholds
+  "Calculate threshold limits for given differences, returns tuple [dashthreshold spacethreshold]"
+  [differences]
+  (transduce non-consecutive-average conj (sort (keys (frequencies differences)))))
+
+
 (defn morse->text
   "Parse input file path wav file to text string"
   [input-wav-path]
-  ;; todo mieti josko tän voisi tehdä threadeten nätimmin
-  (let [input-sound (read-sound input-wav-path)
-        message-chunks (chunks input-sound 44100)
-        amplitudes (flatten (apply concat (map first message-chunks)))
-        highs (:elems (find-highs (map #(apply max %) (partition 441 amplitudes)) 0.11))
-        partial-diffs (map (fn [[a b]] (- b a)) (partition 2 highs))
-        _ (def partial-diffs partial-diffs)
-        partial-diffs-between (map (fn [[a b]] (- b a)) (partition 2 (rest highs)))
-        _ (def partial-diffs-between partial-diffs-between)
-        [dashtreshold spacetreshold] (transduce non-consecutive-average conj (sort (keys (frequencies partial-diffs-between))))
-        word-splits (map (fn [v] (if (> v spacetreshold) " SPACE " (if  (> dashtreshold v) "" " "))) partial-diffs-between)
-        morse (map (fn [v] (if (> 12 v) "." "-")) partial-diffs)
-        morse-string (apply str (interleave morse (lazy-cat word-splits [""])))
-        decoded (apply str (map #(get morse-codes %) (clojure.string/split morse-string #" ")))]
+  (let [input-sound                  (read-sound input-wav-path)
+        message-chunks               (chunks input-sound hz)
+        amplitudes                   (mapcat first message-chunks) ;; get mono channels to one seq
+        highs                        (->> (partition (/ hz 100) amplitudes) ;; downsample to 10 ms partitions
+                                          (map #(apply max %))  ;; find max within partition
+                                          (->highs amplitudethreshold)) ;; get up&down "timestamps"
+        partial-diffs                (map (fn [[a b]] (- b a)) (partition 2 highs)) ;; durations of dits and dashes
+        partial-diffs-between        (map (fn [[a b]] (- b a)) (partition 2 (rest highs))) ;; durations between dits and dashes
+        [dashthreshold spacethreshold] (->thresholds partial-diffs-between) ;; calculate thresholds
+        morse                        (map (fn [i] (if (> dashthreshold i) "." "-")) partial-diffs)
+        word-splits                  (map (fn [i] (cond (> i spacethreshold) " SPACE " (> dashthreshold i) "" :else " ")) partial-diffs-between)
+        morse-string                 (->> (concat word-splits [""])
+                                          (interleave morse) ;; interleave morse dits and dashes with word separators and character separators
+                                          (apply str))
+        decoded                      (->> (clojure.string/split morse-string #" ")
+                                          (map #(get morse-codes %) )
+                                          (apply str))]
     decoded))
 
 (defn -main [& args]
