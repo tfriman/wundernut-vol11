@@ -43,7 +43,7 @@ Install Java (developed and tested with Java 11) and
 
 ## Testing
 
-```lein test``
+```lein test```
 
 ## Running
 
